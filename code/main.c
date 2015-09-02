@@ -57,17 +57,19 @@ create_image (Display * display, Visual * visual, uint8_t * image, int width, in
 {
   fprintf (stdout, "creating image %d x %d\n", width, height);
   int bytes_per_pixel = 4;
-  int pitch = width;
+  uint32_t pitch = width * bytes_per_pixel;
   uint32_t *buffer = (uint32_t *) calloc (width * height, bytes_per_pixel);
-  uint32_t *pixel = buffer; 
-  for (int i = 0; i < width; i++)
+  uint8_t *row = (uint8_t *)buffer;
+  for (int j = 0; j < height; j++)
   {
-    for (int j = 0; j < height; j++)
+    uint32_t *pixel = (uint32_t *)row;
+    for (int i = 0; i < width; i++)
     {
-      uint8_t blue = i % 255;
-      uint8_t green = j % 255;
+      uint8_t blue = i;
+      uint8_t green = j;
       *pixel++ = (green << 8) | blue;
     }
+    row += pitch;
   }
   return XCreateImage (display, visual, 24 /* depth */, ZPixmap /* format */, 0 /* offset */,
                        (char *) buffer, width, height, 32 /* bitmap pad */, 0);
