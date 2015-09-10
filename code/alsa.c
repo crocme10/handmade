@@ -1,6 +1,5 @@
-/* 
- *  This small demo sends a simple sinusoidal wave to your speakers.
- */
+/* This small demo sends a simple sinusoidal wave to your speakers.  */
+/* See http://alsamodular.sourceforge.net/alsa_programming_howto.html */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,556 +11,365 @@
 #include <sys/time.h>
 #include <math.h>
 
-static char *device = "plughw:0,0";	/* playback device */
-static snd_pcm_format_t format = SND_PCM_FORMAT_S16;	/* sample format */
-static unsigned int rate = 44100;	/* stream rate */
-static unsigned int channels = 1;	/* count of channels */
-static unsigned int buffer_time = 500000;	/* ring buffer length in us */
-static unsigned int period_time = 100000;	/* period time in us */
-static double freq = 440;	/* sinusoidal wave frequency in Hz */
-static int verbose = 0;		/* verbose flag */
-static int resample = 1;	/* enable alsa-lib resampling */
-static int period_event = 0;	/* produce poll event after each period */
+// typedef int (*transfer_loop_fn) (snd_pcm_t * handle, signed short *samples,
+// snd_pcm_channel_area_t * areas); 
+typedef struct _sound_info_t sound_info_t;
+struct _sound_info_t {
+    char *device;		/* playback device */
+    snd_pcm_format_t format;	/* sample format */
+    snd_pcm_stream_t stream;	/* stream type */
+    snd_pcm_access_t access;	/* access type */
+    unsigned int rate;	/* stream rate */
+    unsigned int channel_count;	/* count of channels */
+    unsigned int buffer_time;	/* ring buffer length in us */
+    unsigned int period_time;	/* period time in us */
+    double tone_hz;		/* sinusoidal wave frequency in Hz */
+    int resample;		/* enable alsa-lib resampling */
+    int period_event = 0;	/* produce poll event after each period */
+    snd_pcm_sframes_t buffer_size;
+    snd_pcm_sframes_t period_size;
+    snd_output_t *output;
+    snd_pcm_t *handle;
+    snd_pcm_hw_params_t *hw_params;
+    snd_pcm_sw_params_t *sw_params;
+    // transfer_loop_fn transfer_loop;
+};
 
-static snd_pcm_sframes_t buffer_size;
-static snd_pcm_sframes_t period_size;
-static snd_output_t *output = NULL;
+typedef struct _sound_buffer_t sound_buffer_t;
+struct _sound_buffer_t {
+    signed short *samples;
+    snd_pcm_channel_area_t *areas;
+};
 
 static void
-generate_sine (const snd_pcm_channel_area_t * areas, snd_pcm_uframes_t offset, int count, double *_phase)
-{
-    static double max_phase = 2. * M_PI;
+generate_sine (sound_buffer_t * sound_buffer, sound_info_t * sound_info,
+               snd_pcm_uframes_t offset, double *_phase, error_t ** error) {
+    static double max_phase = 2.0 * M_PI;
     double phase = *_phase;
-    double step = max_phase * freq / (double) rate;
-    unsigned char *samples[channels];
-    int steps[channels];
-    unsigned int chn;
-    int format_bits = snd_pcm_format_width (format);
-    unsigned int maxval = (1 << (format_bits - 1)) - 1;
-    int bps = format_bits / 8;	/* bytes per sample */
-    int phys_bps = snd_pcm_format_physical_width (format) / 8;
-    int big_endian = snd_pcm_format_big_endian (format) == 1;
-    int to_unsigned = snd_pcm_format_unsigned (format) == 1;
-    int is_float = (format == SND_PCM_FORMAT_FLOAT_LE || format == SND_PCM_FORMAT_FLOAT_BE);
+    double step = max_phase * sound_info->tone_hz / (double) sound_info->rate;
+    unsigned char *samples[sound_info->channel_count];
+    int steps[sound_info->channel_count];
+    int bits_per_sample = snd_pcm_format_width (sound_info->format);
+    unsigned int maxval = (1 << (bits_per_sample - 1)) - 1;
+    int bytes_per_sample = bits_per_sample / 8;	/* bytes per sample */
+    int phys_bytes_per_sample = snd_pcm_format_physical_width (sound_info->format) / 8;
+    int big_endian = snd_pcm_format_big_endian (sound_info->format) == 1;
+    int to_unsigned = snd_pcm_format_unsigned (sound_info->format) == 1;
+    int is_float = (sound_info->format == SND_PCM_FORMAT_FLOAT_LE
+                    || sound_info->format == SND_PCM_FORMAT_FLOAT_BE);
 
-    /* 
-     * verify and prepare the contents of areas 
-     */
-    for (chn = 0; chn < channels; chn++)
-    {
-	if ((areas[chn].first % 8) != 0)
-	{
-	    printf ("areas[%i].first == %i, aborting...\n", chn, areas[chn].first);
-	    exit (EXIT_FAILURE);
-	}
-	samples[chn] = /* (signed short *) */ (((unsigned char *) areas[chn].addr) + (areas[chn].first / 8));
-	if ((areas[chn].step % 16) != 0)
-	{
-	    printf ("areas[%i].step == %i, aborting...\n", chn, areas[chn].step);
-	    exit (EXIT_FAILURE);
-	}
-	steps[chn] = areas[chn].step / 8;
-	samples[chn] += offset * steps[chn];
+    error_return_if (is_float,, "float format not supported");
+
+    /* verify and prepare the contents of areas */
+    for (unsigned int channel_index = 0; channel_index < sound_info->channel_count;
+         channel_index++) {
+        error_return_if ((sound_buffer->areas[channel_index].first % 8) != 0,,
+                         "areas[%i].first == %i, aborting...", channel_index,
+                         areas[channel_index].first);
+        samples[channel_index] =
+            /* (signed short *) */
+            (((unsigned char *) areas[channel_index].addr) +
+             (areas[channel_index].first / 8));
+        error_return_if ((areas[channel_index].step % 16) != 0,,
+                         "areas[%i].step == %i, aborting...\n", channel_index,
+                         areas[channel_index].step);
+        steps[channel_index] = areas[channel_index].step / 8;
+        samples[channel_index] += offset * steps[channel_index];
     }
-    /* 
-     * fill the channel areas 
-     */
-    while (count-- > 0)
-    {
-	union
-	{
-	    float f;
-	    int i;
-	} fval;
-	int res, i;
-	if (is_float)
-	{
-	    fval.f = sin (phase) * maxval;
-	    res = fval.i;
-	}
-	else
-	    res = sin (phase) * maxval;
-	if (to_unsigned)
-	    res ^= 1U << (format_bits - 1);
-	for (chn = 0; chn < channels; chn++)
-	{
-	    /* 
-	     * Generate data in native endian format 
-	     */
-	    if (big_endian)
-	    {
-		for (i = 0; i < bps; i++)
-		    *(samples[chn] + phys_bps - 1 - i) = (res >> i * 8) & 0xff;
-	    }
-	    else
-	    {
-		for (i = 0; i < bps; i++)
-		    *(samples[chn] + i) = (res >> i * 8) & 0xff;
-	    }
-	    samples[chn] += steps[chn];
-	}
-	phase += step;
-	if (phase >= max_phase)
-	    phase -= max_phase;
+    /* fill the channel areas */
+    int count = sound_info->period_size;
+    while (count-- > 0) {
+        int val = sin (phase) * maxval;
+        if (to_unsigned) {
+            val ^= 1U << (bits_per_sample - 1);
+        }
+
+        for (unsigned int channel_index = 0; channel_index < sound_info->channel_count;
+             channel_index++) {
+            /* Generate data in native endian format */
+            if (big_endian) {
+                for (int i = 0; i < bytes_per_sample; i++)
+                    *(samples[channel_index] + phys_bytes_per_sample - 1 - i) =
+                        (val >> i * 8) & 0xff;
+            }
+            else {
+                for (int i = 0; i < bytes_per_sample; i++)
+                    *(samples[channel_index] + i) = (val >> i * 8) & 0xff;
+            }
+            samples[channel_index] += steps[channel_index];
+        }
+        phase += step;
+        if (phase >= max_phase)
+            phase -= max_phase;
     }
     *_phase = phase;
 }
 
-static int
-set_hwparams (snd_pcm_t * handle, snd_pcm_hw_params_t * params, snd_pcm_access_t access)
-{
-    unsigned int rrate;
+static void
+set_hw_params (sound_info_t * sound_info, error_t ** error) {
+    int res;
+
+    snd_pcm_hw_params_alloca (&sound_info->hw_params);
+
+    /* initialize hw_params with the full configuration space of the soundcard */
+    res = snd_pcm_hw_params_any (sound_info->handle, sound_info->hw_params);
+    error_return_if (res < 0,,
+                     "broken configuration for playback: no configurations available: %s\n",
+                     snd_strerror (res));
+
+    /* set the resampling rate */
+    res = snd_pcm_hw_params_set_rate_resample (sound_info->handle,
+                                               sound_info->hw_params, sound_info->resample);
+    error_return_if (res < 0,, "resampling setup failed for playback: %s\n",
+                     snd_strerror (res));
+
+    /* set the interleaved read/write format */
+    res = snd_pcm_hw_params_set_access (sound_info->handle, sound_info->hw_params,
+                                        sound_info->access);
+    error_return_if (res < 0,, "access type not available for playback: %s\n",
+                     snd_strerror (res));
+
+    /* set the sample format */
+    res = snd_pcm_hw_params_set_format (sound_info->handle, sound_info->hw_params,
+                                        sound_info->format);
+    error_return_if (res < 0,, "sample format not available for playback: %s\n",
+                     snd_strerror (res));
+
+    /* set the count of channels */
+    res = snd_pcm_hw_params_set_channels (sound_info->handle, sound_info->hw_params,
+                                          sound_info->channel_count);
+    error_return_if (res < 0,,
+                     "channels count (%i) not available for playbacks: %s\n",
+                     sound_info->channel_count, snd_strerror (res));
+
+    /* set the stream rate */
+    unsigned int exact_rate = sound_info->sampling_rate;
+    res = snd_pcm_hw_params_set_rate_near (sound_info->handle, sound_info->hw_params,
+                                           &exact_rate, 0);
+    error_return_if (res < 0,, "rate %iHz not available for playback: %s\n",
+                     sound_info->sampling_rate, snd_strerror (res));
+    error_return_if (exact_rate != sound_info->sampling_rate,,
+                     "rate doesn't match (requested %iHz, get %iHz)\n",
+                     sound_info->sampling_rate, exact_rate);
+
+    /* set the buffer time */
+    res = snd_pcm_hw_params_set_buffer_time_near (sound_info->handle,
+                                                  sound_info->hw_params,
+                                                  &sound_info->buffer_time, &dir);
+    error_return_if (res < 0,, "unable to set buffer time %i for playback: %s\n",
+                     sound_info->buffer_time, snd_strerror (res));
+
     snd_pcm_uframes_t size;
-    int err, dir;
+    res = snd_pcm_hw_params_get_buffer_size (sound_info->hw_params, &size);
+    error_return_if (res < 0,, "unable to get buffer size for playback: %s\n",
+                     snd_strerror (res));
+    sound_info->buffer_size = size;
 
-    /* 
-     * choose all parameters 
-     */
-    err = snd_pcm_hw_params_any (handle, params);
-    if (err < 0)
-    {
-	printf ("Broken configuration for playback: no configurations available: %s\n", snd_strerror (err));
-	return err;
-    }
-    /* 
-     * set hardware resampling 
-     */
-    err = snd_pcm_hw_params_set_rate_resample (handle, params, resample);
-    if (err < 0)
-    {
-	printf ("Resampling setup failed for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    /* 
-     * set the interleaved read/write format 
-     */
-    err = snd_pcm_hw_params_set_access (handle, params, access);
-    if (err < 0)
-    {
-	printf ("Access type not available for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    /* 
-     * set the sample format 
-     */
-    err = snd_pcm_hw_params_set_format (handle, params, format);
-    if (err < 0)
-    {
-	printf ("Sample format not available for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    /* 
-     * set the count of channels 
-     */
-    err = snd_pcm_hw_params_set_channels (handle, params, channels);
-    if (err < 0)
-    {
-	printf ("Channels count (%i) not available for playbacks: %s\n", channels, snd_strerror (err));
-	return err;
-    }
-    /* 
-     * set the stream rate 
-     */
-    rrate = rate;
-    err = snd_pcm_hw_params_set_rate_near (handle, params, &rrate, 0);
-    if (err < 0)
-    {
-	printf ("Rate %iHz not available for playback: %s\n", rate, snd_strerror (err));
-	return err;
-    }
-    if (rrate != rate)
-    {
-	printf ("Rate doesn't match (requested %iHz, get %iHz)\n", rate, err);
-	return -EINVAL;
-    }
-    /* 
-     * set the buffer time 
-     */
-    err = snd_pcm_hw_params_set_buffer_time_near (handle, params, &buffer_time, &dir);
-    if (err < 0)
-    {
-	printf ("Unable to set buffer time %i for playback: %s\n", buffer_time, snd_strerror (err));
-	return err;
-    }
-    err = snd_pcm_hw_params_get_buffer_size (params, &size);
-    if (err < 0)
-    {
-	printf ("Unable to get buffer size for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    buffer_size = size;
-    /* 
-     * set the period time 
-     */
-    err = snd_pcm_hw_params_set_period_time_near (handle, params, &period_time, &dir);
-    if (err < 0)
-    {
-	printf ("Unable to set period time %i for playback: %s\n", period_time, snd_strerror (err));
-	return err;
-    }
-    err = snd_pcm_hw_params_get_period_size (params, &size, &dir);
-    if (err < 0)
-    {
-	printf ("Unable to get period size for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    period_size = size;
-    /* 
-     * write the parameters to device 
-     */
-    err = snd_pcm_hw_params (handle, params);
-    if (err < 0)
-    {
-	printf ("Unable to set hw params for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    return 0;
+    /* set the period time */
+    int dir;
+    res = snd_pcm_hw_params_set_period_time_near (sound_info->handle,
+                                                  sound_info->hw_params,
+                                                  &sound_info->period_time, &dir);
+    error_return_if (res < 0,, "unable to set period time %i for playback: %s\n",
+                     sound_info->period_time, snd_strerror (res));
+    res = snd_pcm_hw_params_get_period_size (sound_info->hw_params, &size, &dir);
+    error_return_if (res < 0,, "unable to get period size for playback: %s\n",
+                     snd_strerror (res));
+    sound_info->period_size = size;
+
+    /* write the parameters to device */
+    res = snd_pcm_hw_params (sound_info->handle, sound_info->hw_params);
+    error_return_if (res < 0,, "unable to set hw params for playback: %s\n",
+                     snd_strerror (res));
 }
 
-static int
-set_swparams (snd_pcm_t * handle, snd_pcm_sw_params_t * swparams)
-{
-    int err;
+static void
+set_sw_params (sound_info_t * sound_info, error_t ** error) {
+    int res;
 
-    /* 
-     * get the current swparams 
-     */
-    err = snd_pcm_sw_params_current (handle, swparams);
-    if (err < 0)
-    {
-	printf ("Unable to determine current swparams for playback: %s\n", snd_strerror (err));
-	return err;
+    snd_pcm_sw_params_alloca (&sound_info->sw_params);
+
+    /* get the current sw_params */
+    res = snd_pcm_sw_params_current (sound_info->handle, sound_info->sw_params);
+    error_return_if (res < 0,,
+                     "unable to determine current sw_params for playback: %s\n",
+                     snd_strerror (res));
+
+    /* start the transfer when the buffer is almost full: */
+    /* (buffer_size / avail_min) * avail_min */
+    res = snd_pcm_sw_params_set_start_threshold (sound_info->handle,
+                                                 sound_info->sw_params,
+                                                 (sound_info->buffer_size /
+                                                  sound_info->period_size) *
+                                                 sound_info->period_size);
+    error_return_if (res < 0,,
+                     "unable to set start threshold mode for playback: %s\n",
+                     snd_strerror (res));
+
+    /* allow the transfer when at least period_size samples can be processed */
+    /* or disable this mechanism when period event is enabled (aka intresupt like style
+       processing) */
+    res = snd_pcm_sw_params_set_avail_min (sound_info->handle, sound_info->sw_params,
+                                           sound_info->period_event ? sound_info->
+                                           buffer_size : sound_info->period_size);
+    error_return_if (res < 0,, "unable to set avail min for playback: %s\n",
+                     snd_strerror (res));
+
+    /* enable period events when requested */
+    if (sound_info->period_event) {
+        res = snd_pcm_sw_params_set_period_event (sound_info->handle,
+                                                  sound_info->sw_params, 1);
+        error_return_if (res < 0,, "unable to set period event: %s\n", snd_strerror (res));
     }
-    /* 
-     * start the transfer when the buffer is almost full: 
-     */
-    /* 
-     * (buffer_size / avail_min) * avail_min 
-     */
-    err = snd_pcm_sw_params_set_start_threshold (handle, swparams, (buffer_size / period_size) * period_size);
-    if (err < 0)
-    {
-	printf ("Unable to set start threshold mode for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    /* 
-     * allow the transfer when at least period_size samples can be processed 
-     */
-    /* 
-     * or disable this mechanism when period event is enabled (aka interrupt like style processing) 
-     */
-    err = snd_pcm_sw_params_set_avail_min (handle, swparams, period_event ? buffer_size : period_size);
-    if (err < 0)
-    {
-	printf ("Unable to set avail min for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    /* 
-     * enable period events when requested 
-     */
-    if (period_event)
-    {
-	err = snd_pcm_sw_params_set_period_event (handle, swparams, 1);
-	if (err < 0)
-	{
-	    printf ("Unable to set period event: %s\n", snd_strerror (err));
-	    return err;
-	}
-    }
-    /* 
-     * write the parameters to the playback device 
-     */
-    err = snd_pcm_sw_params (handle, swparams);
-    if (err < 0)
-    {
-	printf ("Unable to set sw params for playback: %s\n", snd_strerror (err));
-	return err;
-    }
-    return 0;
+
+    /* write the parameters to the playback device */
+    res = snd_pcm_sw_params (sound_info->handle, sound_info->sw_params);
+    error_return_if (res < 0,, "unable to set sw params for playback: %s\n",
+                     snd_strerror (res));
 }
 
-/* 
- *   Underrun and suspend recovery
- */
+/* Underrun and suspend recovery */
 
 static int
-xrun_recovery (snd_pcm_t * handle, int err)
-{
-    if (verbose)
-	printf ("stream recovery\n");
-    if (err == -EPIPE)
-    {				/* under-run */
-	err = snd_pcm_prepare (handle);
-	if (err < 0)
-	    printf ("Can't recovery from underrun, prepare failed: %s\n", snd_strerror (err));
-	return 0;
+xrun_recovery (snd_pcm_t * handle, int err, error_t ** error) {
+    printf ("stream recovery\n");
+
+    if (err == -EPIPE) {	/* under-run */
+        err = snd_pcm_prepare (handle);
+        if (err < 0) {
+            printf ("Can't recovery from underrun, prepare failed: %s\n",
+                    snd_strerror (err));
+        }
+        `return 0;
     }
-    else if (err == -ESTRPIPE)
-    {
-	while ((err = snd_pcm_resume (handle)) == -EAGAIN)
-	    sleep (1);		/* wait until the suspend flag is released */
-	if (err < 0)
-	{
-	    err = snd_pcm_prepare (handle);
-	    if (err < 0)
-		printf ("Can't recovery from suspend, prepare failed: %s\n", snd_strerror (err));
-	}
-	return 0;
+    else if (err == -ESTRPIPE) {
+        while ((err = snd_pcm_resume (handle)) == -EAGAIN) {
+            sleep (1);	/* wait until the suspend flag is released */
+        }
+        if (err < 0) {
+            err = snd_pcm_prepare (handle);
+            if (err < 0) {
+                printf ("Can't recovery from suspend, prepare failed: %s\n",
+                        snd_strerror (err));
+            }
+        }
+        return 0;
     }
     return err;
 }
 
-/* 
- *   Transfer method - write only
- */
+/* Transfer method - write only */
 
-static int
-write_loop (snd_pcm_t * handle, signed short *samples, snd_pcm_channel_area_t * areas)
-{
-    double phase = 0;
-    signed short *ptr;
-    int err, cptr;
+static void
+sound_buffer_play (sound_buffer_t * sound_buffer, sound_info_t * sound_info, error_t ** error) {
+    error_t *err = NULL;
+    int res;
 
-    while (1)
-    {
-	generate_sine (areas, 0, period_size, &phase);
-	ptr = samples;
-	cptr = period_size;
-	while (cptr > 0)
-	{
-	    err = snd_pcm_writei (handle, ptr, cptr);
-	    if (err == -EAGAIN)
-		continue;
-	    if (err < 0)
-	    {
-		if (xrun_recovery (handle, err) < 0)
-		{
-		    printf ("Write error: %s\n", snd_strerror (err));
-		    exit (EXIT_FAILURE);
-		}
-		break;		/* skip one period */
-	    }
-	    ptr += err * channels;
-	    cptr -= err;
-	}
+    while (1) {
+        double phase = 0;
+        generate_sine (sound_buffer, sound_info, 0, &phase, &err);
+        error_return_if (err != NULL, err, "error generating sine");
+        signed short *ptr = sound_buffer->samples;
+        int cptr = sound_info->period_size;
+        while (cptr > 0) {
+            res = snd_pcm_writei (sound_info->handle, ptr, cptr);
+            if (res == -EAGAIN) {
+                continue;
+            }
+            if (res < 0) {
+                xrun_recovery (sound_info->handle, res, &err);
+                error_return_if (err != NULL,, "write error: %s\n",
+                                 snd_strerror (err));
+                break;	/* skip one period */
+            }
+            ptr += res * sound_info->channel_count;
+            cptr -= res;
+        }
     }
 }
 
-
-/* 
- *
- */
-
-struct transfer_method
-{
-    const char *name;
-    snd_pcm_access_t access;
-    int (*transfer_loop) (snd_pcm_t * handle, signed short *samples, snd_pcm_channel_area_t * areas);
-};
-
-static struct transfer_method transfer_methods[] = {
-    {"write", SND_PCM_ACCESS_RW_INTERLEAVED, write_loop},
-    {NULL, SND_PCM_ACCESS_RW_INTERLEAVED, NULL}
-};
-
 static void
-help (void)
-{
-    int k;
-    printf ("Usage: pcm [OPTION]... [FILE]...\n"
-	"-h,--help	help\n"
-	"-D,--device	playback device\n"
-	"-r,--rate	stream rate in Hz\n"
-	"-c,--channels	count of channels in stream\n"
-	"-f,--frequency	sine wave frequency in Hz\n"
-	"-b,--buffer	ring buffer size in us\n"
-	"-p,--period	period size in us\n"
-	"-m,--method	transfer method\n"
-	"-o,--format	sample format\n"
-	"-v,--verbose   show the PCM setup parameters\n"
-	"-n,--noresample  do not resample\n" "-e,--pevent    enable poll event after each period\n" "\n");
-    printf ("Recognized sample formats are:");
-    for (k = 0; k < SND_PCM_FORMAT_LAST; ++k)
-    {
-	const char *s = snd_pcm_format_name (k);
-	if (s)
-	    printf (" %s", s);
+sound_info_init (sound_info_t * sound_info, error_t ** error) {
+    int res;
+    error_t *err = NULL;
+
+    res = snd_output_stdio_attach (&sound_info->output, stdout, 0);
+    error_return_if (res < 0,, "output failed: %s", snd_strerror (res));
+
+    /* opens a PCM. we use the playback stream (as opposed to the capture stream 0, the
+       standard opening mode */
+    res = snd_pcm_open (&sound_info->handle, sound_info->device, sound_info->stream, 0);
+    error_return_if (res < 0,, "could not open PCM device: %s", sndstrerror (res));
+
+    set_hw_params (&sound_info, &err);
+    error_goto_if (err != NULL, pcm_close, err, "could not set hw params");
+
+    set_sw_params (&sound_info, &err);
+    error_goto_if (err != NULL, pcm_close, err, "could not set sw params");
+
+pcm_close:
+    snd_pcm_close (sound_info->handle);
+}
+
+void
+sound_buffer_init (sound_buffer_t * sound_buffer, sound_info_t * sound_info, error_t ** error) {
+    sound_buffer->samples =
+        malloc ((sound_info->period_size * sound_info->channel_count *
+                 snd_pcm_format_physical_width (sound_info->format)) / 8);
+    error_return_if (sound_buffer->samples == NULL,, "no enough memory");
+
+    sound_buffer->areas = calloc (sound_info->channel_count, sizeof (snd_pcm_channel_area_t));
+    error_return_if (sound_buffer->areas == NULL,, "no enough memory\n");
+
+    for (unsigned int i = 0; i < sound_buffer->channel_count; i++) {
+        sound_buffer->areas[i].addr = sound_buffer->samples;
+        sound_buffer->areas[i].first =
+            i * snd_pcm_format_physical_width (sound_info->format);
+        sound_buffer->areas[i].step =
+            channels * snd_pcm_format_physical_width (sound_info->format);
     }
-    printf ("\n");
-    printf ("Recognized transfer methods are:");
-    for (k = 0; transfer_methods[k].name; k++)
-	printf (" %s", transfer_methods[k].name);
-    printf ("\n");
+}
+
+void
+sound_buffer_free (sound_buffer_t * sound_buffer) {
+    free (sound_buffer->samples);
+    free (sound_buffer->areas);
 }
 
 int
-main (int argc, char *argv[])
-{
-    struct option long_option[] = {
-	{"help", 0, NULL, 'h'},
-	{"device", 1, NULL, 'D'},
-	{"rate", 1, NULL, 'r'},
-	{"channels", 1, NULL, 'c'},
-	{"frequency", 1, NULL, 'f'},
-	{"buffer", 1, NULL, 'b'},
-	{"period", 1, NULL, 'p'},
-	{"method", 1, NULL, 'm'},
-	{"format", 1, NULL, 'o'},
-	{"verbose", 1, NULL, 'v'},
-	{"noresample", 1, NULL, 'n'},
-	{"pevent", 1, NULL, 'e'},
-	{NULL, 0, NULL, 0},
-    };
-    snd_pcm_t *handle;
-    int err, morehelp;
-    snd_pcm_hw_params_t *hwparams;
-    snd_pcm_sw_params_t *swparams;
-    int method = 0;
-    signed short *samples;
-    unsigned int chn;
-    snd_pcm_channel_area_t *areas;
+main (int argc, char *argv[]) {
+    int res;
+    error_t *err = NULL;
 
-    snd_pcm_hw_params_alloca (&hwparams);
-    snd_pcm_sw_params_alloca (&swparams);
+    char pcm_device[] = "plughw:0,0";
 
-    morehelp = 0;
-    while (1)
-    {
-	int c;
-	if ((c = getopt_long (argc, argv, "hD:r:c:f:b:p:m:o:vne", long_option, NULL)) < 0)
-	    break;
-	switch (c)
-	{
-	  case 'h':
-	      morehelp++;
-	      break;
-	  case 'D':
-	      device = strdup (optarg);
-	      break;
-	  case 'r':
-	      rate = atoi (optarg);
-	      rate = rate < 4000 ? 4000 : rate;
-	      rate = rate > 196000 ? 196000 : rate;
-	      break;
-	  case 'c':
-	      channels = atoi (optarg);
-	      channels = channels < 1 ? 1 : channels;
-	      channels = channels > 1024 ? 1024 : channels;
-	      break;
-	  case 'f':
-	      freq = atoi (optarg);
-	      freq = freq < 50 ? 50 : freq;
-	      freq = freq > 5000 ? 5000 : freq;
-	      break;
-	  case 'b':
-	      buffer_time = atoi (optarg);
-	      buffer_time = buffer_time < 1000 ? 1000 : buffer_time;
-	      buffer_time = buffer_time > 1000000 ? 1000000 : buffer_time;
-	      break;
-	  case 'p':
-	      period_time = atoi (optarg);
-	      period_time = period_time < 1000 ? 1000 : period_time;
-	      period_time = period_time > 1000000 ? 1000000 : period_time;
-	      break;
-	  case 'm':
-	      for (method = 0; transfer_methods[method].name; method++)
-		  if (!strcasecmp (transfer_methods[method].name, optarg))
-		      break;
-	      if (transfer_methods[method].name == NULL)
-		  method = 0;
-	      break;
-	  case 'o':
-	      for (format = 0; format < SND_PCM_FORMAT_LAST; format++)
-	      {
-		  const char *format_name = snd_pcm_format_name (format);
-		  if (format_name)
-		      if (!strcasecmp (format_name, optarg))
-			  break;
-	      }
-	      if (format == SND_PCM_FORMAT_LAST)
-		  format = SND_PCM_FORMAT_S16;
-	      if (!snd_pcm_format_linear (format) && !(format == SND_PCM_FORMAT_FLOAT_LE || format == SND_PCM_FORMAT_FLOAT_BE))
-	      {
-		  printf ("Invalid (non-linear/float) format %s\n", optarg);
-		  return 1;
-	      }
-	      break;
-	  case 'v':
-	      verbose = 1;
-	      break;
-	  case 'n':
-	      resample = 0;
-	      break;
-	  case 'e':
-	      period_event = 1;
-	      break;
-	}
-    }
+    sound_info_t sound_info = { };
+    sound_info.device = pcm_device;
+    sound_info.format = SND_PCM_FORMAT_S16;	/* Signed 16bit CPU endian */
+    sound_info.stream = SND_PCM_STREAM_PLAYBACK;	/* playback stream */
+    sound_info.access = SND_PCM_ACCESS_RW_INTERLEAVED	/* access type */
+        sound_info.sampling_rate = 44100;	/* stream rate */
+    sound_info.channel_count = 2;	/* count of channels */
+    sound_info.buffer_time = 500000;	/* ring buffer length in us */
+    sound_info.period_time = 100000;	/* period time in us */
+    sound_info.tone_hz = 440.0f;	/* sinusoidal wave frequency in Hz */
+    sound_info.resampling = 1;	/* enable alsa-lib resampling */
+    sound_info.period_event = 0;	/* produce poll event after each period */
 
-    if (morehelp)
-    {
-	help ();
-	return 0;
-    }
+    sound_info_init (&sound_info, &err);
+    error_log_if (err != NULL,, "unable to initialize ALSA sound info");
 
-    err = snd_output_stdio_attach (&output, stdout, 0);
-    if (err < 0)
-    {
-	printf ("Output failed: %s\n", snd_strerror (err));
-	return 0;
-    }
+    sound_buffer_init (&sound_buffer, &sound_info, &err);
+    error_log_if (err != NULL,, "unable to initialize ALSA sound buffer");
 
-    printf ("Playback device is %s\n", device);
-    printf ("Stream parameters are %iHz, %s, %i channels\n", rate, snd_pcm_format_name (format), channels);
-    printf ("Sine wave rate is %.4fHz\n", freq);
-    printf ("Using transfer method: %s\n", transfer_methods[method].name);
+    sound_buffer_play (&sound_buffer, &sound_info, &err);
+    error_log_if (err != NULL,, "unable to play ALSA sound buffer");
 
-    if ((err = snd_pcm_open (&handle, device, SND_PCM_STREAM_PLAYBACK, 0)) < 0)
-    {
-	printf ("Playback open error: %s\n", snd_strerror (err));
-	return 0;
-    }
+buffer_cleanup:
+    sound_buffer_free (&sound_buffer);
 
-    if ((err = set_hwparams (handle, hwparams, transfer_methods[method].access)) < 0)
-    {
-	printf ("Setting of hwparams failed: %s\n", snd_strerror (err));
-	exit (EXIT_FAILURE);
-    }
-    if ((err = set_swparams (handle, swparams)) < 0)
-    {
-	printf ("Setting of swparams failed: %s\n", snd_strerror (err));
-	exit (EXIT_FAILURE);
-    }
+pcm_close:
+    snd_pcm_close (sound_info->handle);
 
-    if (verbose > 0)
-	snd_pcm_dump (handle, output);
-
-    samples = malloc ((period_size * channels * snd_pcm_format_physical_width (format)) / 8);
-    if (samples == NULL)
-    {
-	printf ("No enough memory\n");
-	exit (EXIT_FAILURE);
-    }
-
-    areas = calloc (channels, sizeof (snd_pcm_channel_area_t));
-    if (areas == NULL)
-    {
-	printf ("No enough memory\n");
-	exit (EXIT_FAILURE);
-    }
-    for (chn = 0; chn < channels; chn++)
-    {
-	areas[chn].addr = samples;
-	areas[chn].first = chn * snd_pcm_format_physical_width (format);
-	areas[chn].step = channels * snd_pcm_format_physical_width (format);
-    }
-
-    err = transfer_methods[method].transfer_loop (handle, samples, areas);
-    if (err < 0)
-	printf ("Transfer failed: %s\n", snd_strerror (err));
-
-    free (areas);
-    free (samples);
-    snd_pcm_close (handle);
     return 0;
 }
