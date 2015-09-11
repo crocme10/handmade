@@ -35,8 +35,10 @@
 for file in *.c; do
     [ -e "$file" ] || continue
     echo "indenting $file"
-    $HOME/dev/bin/indent -nbad -bap -bbo -br -bls -brf -cli4 -cbi0 -di0 -nbfde -nbfda -fc1 -fca -hnl -i8 -ip8 -il8 -l100 -lp -pcs -cs -bs -saf -sai -saw -nbc -psl -nsob -nss -ts8 $file
-    # GNU $HOME/dev/bin/indent $file
-    # LINUX $HOME/dev/bin/indent -nbad -bap -nbc -bbo -hnl -br -brs -c33 -cd33 -ncdb -ce -ci4 -cli0 -d0 -di1 -nfc1 -i8 -ip0 -l80 -lp -npcs -nprs -npsl -sai -saf -saw -ncs -nsc -sob -nfca -cp33 -ss -ts8 -il1 $file
+    $HOME/dev/bin/indent -nbad -bap -bbo -br -bls -blf -cli4 -cbi0 -di0 -nbfde -nbfda -fc1 -fca -hnl -i4 -ip4 -il4 -l100 -lp -pcs -cs -bs -saf -sai -saw -nbc -psl -nsob -nss -ts4 "$file"
+    sed -e $'s/\t/    /g' "$file" > "$file.bak"
+    mv "$file.bak" "$file"
+    sed -e 'N;s/}\n.*break/} break/' "$file" > "$file.bak"
+    mv "$file.bak" "$file"
 done
 
